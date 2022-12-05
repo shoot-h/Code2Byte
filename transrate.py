@@ -17,23 +17,19 @@ from torchtext.vocab import vocab
 from torchtext.utils import download_from_url, extract_archive
 import readfile
 from transformers import BertModel
+import Levenshtein
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+model_dir_path = Path('translateModel')
+model_name = 'gpu_translationSrc_transfomer.pth'
 
-model_dir_path = Path('transrateModel')
-if not model_dir_path.exists():
-    model_dir_path.mkdir(parents=True)
+batch_size = 1
 
-texts_src_train, texts_tgt_train = readfile.readf(1,33)
-texts_src_valid, texts_tgt_valid = readfile.readf(33,65)
-
-#for src, tgt in zip(texts_src_train[:3], texts_tgt_train[:3]):
-#    print(src.strip('\n'))
-#    print('↓')
-#    print(tgt.strip('\n'))
-#    print('')
-tokenizer_src = get_tokenizer(readfile.srctokenize)
-tokenizer_tgt = get_tokenizer(readfile.texttokenize)
+embedding_size = 256
+nhead = 8
+dim_feedforward = 100
+num_encoder_layers = 2
+num_decoder_layers = 2
+dropout = 0.1
 
 def build_vocab(texts, tokenizer):
     
@@ -41,15 +37,6 @@ def build_vocab(texts, tokenizer):
     for text in texts:
         counter.update(tokenizer(text))
     return vocab(counter, specials=['<unk>', '<pad>', '<start>', '<end>'])
-
-vocab_src = build_vocab(texts_src_train, tokenizer_src)
-vocab_tgt = build_vocab(texts_tgt_train, tokenizer_tgt)
-
-for char, index in list(vocab_src.get_stoi().items())[:15]:
-    print('Char: {: <8} → Index: {: <2}'.format(char, index))
-
-vocab_src.set_default_index(vocab_src['<unk>'])
-vocab_tgt.set_default_index(vocab_tgt['<unk>'])
 
 def data_process(texts_src, texts_tgt, vocab_src, vocab_tgt, tokenizer_src, tokenizer_tgt):
     
@@ -70,21 +57,6 @@ def data_process(texts_src, texts_tgt, vocab_src, vocab_tgt, tokenizer_src, toke
 def convert_text_to_indexes(text, vocab, tokenizer):
     return [vocab['<start>']] + [vocab[token] for token in tokenizer(text.strip("\n"))] + [vocab['<end>']]
 
-train_data = data_process(
-    texts_src=texts_src_train, texts_tgt=texts_tgt_train,
-    vocab_src=vocab_src, vocab_tgt=vocab_tgt,
-    tokenizer_src=tokenizer_src, tokenizer_tgt=tokenizer_tgt
-)
-valid_data = data_process(
-    texts_src=texts_src_valid, texts_tgt=texts_tgt_valid,
-    vocab_src=vocab_src, vocab_tgt=vocab_tgt,
-    tokenizer_src=tokenizer_src, tokenizer_tgt=tokenizer_tgt
-)
-batch_size = 4
-PAD_IDX = vocab_src['<pad>']
-START_IDX = vocab_src['<start>']
-END_IDX = vocab_src['<end>']
-
 def generate_batch(data_batch):
     
     batch_src, batch_tgt = [], []
@@ -96,9 +68,6 @@ def generate_batch(data_batch):
     batch_tgt = pad_sequence(batch_tgt, padding_value=PAD_IDX)
     
     return batch_src, batch_tgt
-
-train_iter = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=generate_batch)
-valid_iter = DataLoader(valid_data, batch_size=batch_size, shuffle=True, collate_fn=generate_batch)
 
 class Seq2SeqTransformer(nn.Module):
     
@@ -160,7 +129,7 @@ class TokenEmbedding(nn.Module):
 
 class PositionalEncoding(nn.Module):
     
-    def __init__(self, embedding_size: int, dropout: float, maxlen: int = 5000):
+    def __init__(self, embedding_size: int, dropout: float, maxlen: int = 6000):
         super(PositionalEncoding, self).__init__()
         
         den = torch.exp(-torch.arange(0, embedding_size, 2) * math.log(10000) / embedding_size)
@@ -253,97 +222,18 @@ def evaluate(model, data, criterion, PAD_IDX):
         
     return losses / len(data)
 
-vocab_size_src = len(vocab_src)
-vocab_size_tgt = len(vocab_tgt)
-embedding_size = 240
-nhead = 8
-dim_feedforward = 100
-num_encoder_layers = 2
-num_decoder_layers = 2
-dropout = 0.1
+class JavaDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
 
-model = Seq2SeqTransformer(
-    num_encoder_layers=num_encoder_layers,
-    num_decoder_layers=num_decoder_layers,
-    embedding_size=embedding_size,
-    vocab_size_src=vocab_size_src, vocab_size_tgt=vocab_size_tgt,
-    dim_feedforward=dim_feedforward,
-    dropout=dropout, nhead=nhead
-)
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
 
-for p in model.parameters():
-    if p.dim() > 1:
-        nn.init.xavier_uniform_(p)
-
-# model = BertModel.from_pretrained("bert-base-multilingual-cased")
-
-model = model.to(device)
-
-criterion = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-
-optimizer = torch.optim.Adam(model.parameters())
-
-epoch = 100
-best_loss = float('Inf')
-best_model = None
-patience = 10
-counter = 0
-
-for loop in range(1, epoch + 1):
-    
-    start_time = time.time()
-    
-    loss_train = train(
-        model=model, data=train_iter, optimizer=optimizer,
-        criterion=criterion, PAD_IDX=PAD_IDX
-    )
-    
-    elapsed_time = time.time() - start_time
-    
-    loss_valid = evaluate(
-        model=model, data=valid_iter, criterion=criterion, PAD_IDX=PAD_IDX
-    )
-    
-    print('[{}/{}] train loss: {:.2f}, valid loss: {:.2f}  [{}{:.0f}s] count: {}, {}'.format(
-        loop, epoch,
-        loss_train, loss_valid,
-        str(int(math.floor(elapsed_time / 60))) + 'm' if math.floor(elapsed_time / 60) > 0 else '',
-        elapsed_time % 60,
-        counter,
-        '**' if best_loss > loss_valid else ''
-    ))
-    
-    if best_loss > loss_valid:
-        best_loss = loss_valid
-        best_model = model
-        counter = 0
-        
-    if counter > patience:
-        break
-    
-    counter += 1
-
-torch.save(best_model.state_dict(), model_dir_path.joinpath('translation_transfomer.pth'))
-
-def translate(
-    model, text, vocab_src, vocab_tgt, tokenizer_src, seq_len_tgt,
-    START_IDX, END_IDX
-):
-    
-    model.eval()
-    tokens = convert_text_to_indexes(text=text, vocab=vocab_src, tokenizer=tokenizer_src)
-    num_tokens = len(tokens)
-    src = torch.LongTensor(tokens).reshape(num_tokens, 1)
-    mask_src = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
-    
-    predicts = greedy_decode(
-        model=model, src=src,
-        mask_src=mask_src, seq_len_tgt=seq_len_tgt,
-        START_IDX=START_IDX, END_IDX=END_IDX
-    ).flatten()
-    
-    return ' '.join([vocab_tgt.get_itos()[token] for token in predicts]).replace("<start>", "").replace("<end>", "")
-
+    def __len__(self):
+        return len(self.labels)
 
 def greedy_decode(model, src, mask_src, seq_len_tgt, START_IDX, END_IDX):
     
@@ -372,14 +262,190 @@ def greedy_decode(model, src, mask_src, seq_len_tgt, START_IDX, END_IDX):
             
     return ys
 
-seq_len_tgt = max([len(x[1]) for x in train_data])
+def translate(
+    model, text, vocab_src, vocab_tgt, tokenizer_src, seq_len_tgt,
+    START_IDX, END_IDX
+):
+    
+    model.eval()
+    tokens = convert_text_to_indexes(text=text, vocab=vocab_src, tokenizer=tokenizer_src)
+    num_tokens = len(tokens)
+    src = torch.LongTensor(tokens).reshape(num_tokens, 1)
+    mask_src = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
+    
+    predicts = greedy_decode(
+        model=model, src=src,
+        mask_src=mask_src, seq_len_tgt=seq_len_tgt,
+        START_IDX=START_IDX, END_IDX=END_IDX
+    ).flatten()
+    
+    return ' '.join([vocab_tgt.get_itos()[token] for token in predicts]).replace("<start>", "").replace("<end>", "")
 
-f = open('Hello.java', 'r')
-text = f.read()
-f.close()
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cpu')
 
-print(translate(
-    model=best_model, text=text, vocab_src=vocab_src, vocab_tgt=vocab_tgt,
-    tokenizer_src=tokenizer_src, seq_len_tgt=seq_len_tgt,
-    START_IDX=START_IDX, END_IDX=END_IDX
-))
+
+
+if not model_dir_path.exists():
+    model_dir_path.mkdir(parents=True)
+
+#datadivide = 16021
+
+texts_src, texts_tgt = readfile.readf(0,1000)
+datadivide = len(texts_src)//10
+
+texts_src_train = texts_src[:datadivide*8]
+texts_src_valid = texts_src[datadivide*8:datadivide*9]
+texts_src_test = texts_src[datadivide*9:]
+
+texts_tgt_train = texts_tgt[:datadivide*8]
+texts_tgt_valid = texts_tgt[datadivide*8:datadivide*9]
+texts_tgt_test = texts_tgt[datadivide*9:]
+
+print("trainsize:",len(texts_src_train))
+print("validsize:",len(texts_src_valid))
+print("testsize:",len(texts_src_test))
+#texts_src_train, texts_tgt_train = readfile.readf(0,datadivide)
+#texts_src_valid, texts_tgt_valid = readfile.readf(datadivide,35000)
+
+#for src, tgt in zip(texts_src_train[:3], texts_tgt_train[:3]):
+#    print(src.strip('\n'))
+#    print('↓')
+#    print(tgt.strip('\n'))
+#    print('')
+tokenizer_src = get_tokenizer(readfile.srctokenize)
+tokenizer_tgt = get_tokenizer(readfile.texttokenize)
+
+vocab_src = build_vocab(texts_src_train, tokenizer_src)
+vocab_tgt = build_vocab(texts_tgt_train, tokenizer_tgt)
+
+# for char, index in list(vocab_src.get_stoi().items())[:15]:
+#     print('Char: {: <8} → Index: {: <2}'.format(char, index))
+
+vocab_src.set_default_index(vocab_src['<unk>'])
+vocab_tgt.set_default_index(vocab_tgt['<unk>'])
+
+
+
+train_data = data_process(
+    texts_src=texts_src_train, texts_tgt=texts_tgt_train,
+    vocab_src=vocab_src, vocab_tgt=vocab_tgt,
+    tokenizer_src=tokenizer_src, tokenizer_tgt=tokenizer_tgt
+)
+valid_data = data_process(
+    texts_src=texts_src_valid, texts_tgt=texts_tgt_valid,
+    vocab_src=vocab_src, vocab_tgt=vocab_tgt,
+    tokenizer_src=tokenizer_src, tokenizer_tgt=tokenizer_tgt
+)
+
+PAD_IDX = vocab_src['<pad>']
+START_IDX = vocab_src['<start>']
+END_IDX = vocab_src['<end>']
+
+
+
+train_iter = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=generate_batch)
+valid_iter = DataLoader(valid_data, batch_size=batch_size, shuffle=True, collate_fn=generate_batch)
+
+
+
+vocab_size_src = len(vocab_src)
+vocab_size_tgt = len(vocab_tgt)
+
+model = Seq2SeqTransformer(
+    num_encoder_layers=num_encoder_layers,
+    num_decoder_layers=num_decoder_layers,
+    embedding_size=embedding_size,
+    vocab_size_src=vocab_size_src, vocab_size_tgt=vocab_size_tgt,
+    dim_feedforward=dim_feedforward,
+    dropout=dropout, nhead=nhead
+)
+
+for p in model.parameters():
+    if p.dim() > 1:
+        nn.init.xavier_uniform_(p)
+
+# model = BertModel.from_pretrained("bert-base-multilingual-cased")
+
+model = model.to(device)
+
+
+if __name__=='__main__':
+
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+
+    optimizer = torch.optim.Adam(model.parameters())
+
+    epoch = 100
+    best_loss = float('Inf')
+    best_model = None
+    patience = 10
+    counter = 0
+
+    time_sta = time.time()
+    for loop in range(1, epoch + 1):
+        
+        start_time = time.time()
+        
+        loss_train = train(
+            model=model, data=train_iter, optimizer=optimizer,
+            criterion=criterion, PAD_IDX=PAD_IDX
+        )
+        
+        elapsed_time = time.time() - start_time
+        
+        loss_valid = evaluate(
+            model=model, data=valid_iter, criterion=criterion, PAD_IDX=PAD_IDX
+        )
+        
+        print('[{}/{}] train loss: {:.2f}, valid loss: {:.2f}  [{}{:.0f}s] count: {}, {}'.format(
+            loop, epoch,
+            loss_train, loss_valid,
+            str(int(math.floor(elapsed_time / 60))) + 'm' if math.floor(elapsed_time / 60) > 0 else '',
+            elapsed_time % 60,
+            counter,
+            '**' if best_loss > loss_valid else ''
+        ))
+        
+        if best_loss > loss_valid:
+            best_loss = loss_valid
+            best_model = model
+            counter = 0
+            
+        if counter > patience:
+            break
+        
+        counter += 1
+    # 時間計測終了
+    time_end = time.time()
+    # 経過時間（秒）
+    tim = time_end- time_sta
+
+    print(tim)
+    torch.save(best_model.state_dict(), model_dir_path.joinpath(model_name))
+
+    # seq_len_tgt = max([len(x[1]) for x in train_data])
+
+    # sum_ratio = 0
+    # total_test = 0
+
+    # fl = open('LevenSrc.txt', 'w')
+
+    # for i in tqdm(range(len(texts_src_test))):
+    #     try:
+            
+    #         mbyte = translate(
+    #             model=best_model, text=texts_src_test[i], vocab_src=vocab_src, vocab_tgt=vocab_tgt,
+    #             tokenizer_src=tokenizer_src, seq_len_tgt=seq_len_tgt,
+    #             START_IDX=START_IDX, END_IDX=END_IDX
+    #         )
+    #         total_test += 1
+    #         Lratio = Levenshtein.ratio(texts_tgt_test[i],mbyte)
+    #         sum_ratio += Lratio
+    #         fl.write("{}\n".format(Lratio))
+    #     except:
+    #             pass
+
+    # fl.close()
+    # print(total_test)
+    # print(sum_ratio/total_test)
